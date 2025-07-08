@@ -193,7 +193,7 @@ async fn compare_files(
                     break;
                 }
             } else {
-                info!("Skipping {:?} due to no change", task.source_path);
+                // debug!("Skipping {:?} due to no change", task.source_path);
             }
         }
     }
@@ -210,7 +210,6 @@ async fn copy_files(
     while let Ok(task) = rx.recv().await {
         if !task.metadata.is_dir() {
             if let Some(parent) = task.dest_path.parent() {
-                info!("{:?}", parent);
                 if !dry_run {
                     async_fs::create_dir_all(parent).await?;
                 }
@@ -253,11 +252,8 @@ async fn adjust_metadata(rx: async_channel::Receiver<MetadataTask>, dry_run: boo
                 fs::set_permissions(&task.dest_path, permissions)?;
 
                 if let Ok(mtime) = task.metadata.modified() {
-                    if let Ok(atime) = task.metadata.accessed() {
-                        let mtime = filetime::FileTime::from_system_time(mtime);
-                        let atime = filetime::FileTime::from_system_time(atime);
-                        filetime::set_file_times(&task.dest_path, atime, mtime)?;
-                    }
+                    let mtime = filetime::FileTime::from_system_time(mtime);
+                    filetime::set_file_mtime(&task.dest_path, mtime)?;
                 }
             }
         }
