@@ -179,7 +179,9 @@ async fn copy_files(
                     async_fs::copy(&task.source_path, &task.dest_path).await?;
                 }
                 // Update the destination metadata
-                task.dest_metadata = Some(fs::metadata(&task.dest_path).unwrap());
+                if let Ok(dm) = fs::metadata(&task.dest_path) {
+                    task.dest_metadata = Some(dm);
+                }
             }
         }
 
@@ -201,40 +203,40 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
             let mut changed = false;
 
             let sm = &task.source_metadata;
-            let dm = task.dest_metadata.as_ref().unwrap();
-
-            // Set permissions if necessary
-            if sm.mode() != dm.mode() {
-                let permissions = fs::Permissions::from_mode(sm.mode());
-                if !dry_run {
-                    async_fs::set_permissions(&task.dest_path, permissions).await?;
+            if let Some(dm) = task.dest_metadata {
+                // Set permissions if necessary
+                if sm.mode() != dm.mode() {
+                    let permissions = fs::Permissions::from_mode(sm.mode());
+                    if !dry_run {
+                        async_fs::set_permissions(&task.dest_path, permissions).await?;
+                    }
+                    changed = true;
                 }
-                changed = true;
-            }
 
-            // Set mtime
-            if let Ok(smtime) = sm.modified() {
-                if let Ok(dmtime) = dm.modified() {
-                    if smtime != dmtime {
-                        let mtime = filetime::FileTime::from_system_time(smtime);
-                        if !dry_run {
-                            filetime::set_file_mtime(&task.dest_path, mtime)?;
+                // Set mtime
+                if let Ok(smtime) = sm.modified() {
+                    if let Ok(dmtime) = dm.modified() {
+                        if smtime != dmtime {
+                            let mtime = filetime::FileTime::from_system_time(smtime);
+                            if !dry_run {
+                                filetime::set_file_mtime(&task.dest_path, mtime)?;
+                            }
+                            changed = true;
                         }
-                        changed = true;
                     }
                 }
-            }
 
-            // set user
-            if sm.uid() != dm.uid() {
-                if !dry_run {
-                    chown(&task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
+                // set user
+                if sm.uid() != dm.uid() {
+                    if !dry_run {
+                        chown(&task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
+                    }
+                    changed = true;
                 }
-                changed = true;
-            }
 
-            if changed {
-                // info!("set attrs: {:?}", &task.dest_path);
+                if changed {
+                    // info!("set attrs: {:?}", &task.dest_path);
+                }
             }
         }
     }
