@@ -191,9 +191,6 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
     use std::os::unix::fs::{MetadataExt, chown};
 
     while let Ok(task) = rx.recv().await {
-        if dry_run {
-            continue;
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -205,7 +202,9 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
             // Set permissions if necessary
             if sm.mode() != dm.mode() {
                 let permissions = fs::Permissions::from_mode(sm.mode());
-                async_fs::set_permissions(&task.dest_path, permissions).await?;
+                if !dry_run {
+                    async_fs::set_permissions(&task.dest_path, permissions).await?;
+                }
                 changed = true;
             }
 
@@ -214,7 +213,9 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
                 if let Ok(dmtime) = dm.modified() {
                     if smtime != dmtime {
                         let mtime = filetime::FileTime::from_system_time(smtime);
-                        filetime::set_file_mtime(&task.dest_path, mtime)?;
+                        if !dry_run {
+                            filetime::set_file_mtime(&task.dest_path, mtime)?;
+                        }
                         changed = true;
                     }
                 }
@@ -222,7 +223,9 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
 
             // set user
             if sm.uid() != dm.uid() {
-                chown(&task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
+                if !dry_run {
+                    chown(&task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
+                }
                 changed = true;
             }
 
