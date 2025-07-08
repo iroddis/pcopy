@@ -14,6 +14,8 @@ struct Args {
 
     source: PathBuf,
     destination: PathBuf,
+
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +62,7 @@ async fn main() -> Result<()> {
     let source = args.source.clone();
     let destination = args.destination.clone();
     let parallelism = args.parallelism;
+    let dry_run = args.dry_run;
 
     let discovery_handle =
         tokio::spawn(async move { discover_files(source, destination, discovery_tx).await });
@@ -69,10 +72,10 @@ async fn main() -> Result<()> {
 
     let copy_handles: Vec<_> = (0..parallelism)
         .map(|_| (comparison_rx.clone(), copy_tx.clone()))
-        .map(|(comp, copy)| tokio::spawn(async move { copy_files(comp, copy).await }))
+        .map(|(comp, copy)| tokio::spawn(async move { copy_files(comp, copy, dry_run).await }))
         .collect();
 
-    let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx).await });
+    let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx, dry_run).await });
 
     discovery_handle.await??;
     comparison_handle.await??;
@@ -199,16 +202,23 @@ async fn compare_files(
 async fn copy_files(
     rx: async_channel::Receiver<CopyTask>,
     tx: async_channel::Sender<MetadataTask>,
+    dry_run: bool,
 ) -> Result<()> {
     use tokio::fs as async_fs;
 
     while let Ok(task) = rx.recv().await {
         if !task.metadata.is_dir() {
             if let Some(parent) = task.dest_path.parent() {
-                async_fs::create_dir_all(parent).await?;
+                info!("{:?}", parent);
+                if !dry_run {
+                    async_fs::create_dir_all(parent).await?;
+                }
             }
 
-            async_fs::copy(&task.source_path, &task.dest_path).await?;
+            info!("{:?}", task.dest_path);
+            if !dry_run {
+                async_fs::copy(&task.source_path, &task.dest_path).await?;
+            }
         }
 
         if tx
@@ -225,11 +235,14 @@ async fn copy_files(
     Ok(())
 }
 
-async fn adjust_metadata(rx: async_channel::Receiver<MetadataTask>) -> Result<()> {
+async fn adjust_metadata(rx: async_channel::Receiver<MetadataTask>, dry_run: bool) -> Result<()> {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
 
     while let Ok(task) = rx.recv().await {
+        if dry_run {
+            continue;
+        }
         if let Ok(_dest_metadata) = fs::metadata(&task.dest_path) {
             #[cfg(unix)]
             {
