@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_channel::unbounded;
 use clap::Parser;
 use std::path::PathBuf;
+use tokio::fs as async_fs;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -23,20 +24,21 @@ struct Args {
 struct FileTask {
     source_path: PathBuf,
     dest_path: PathBuf,
-    metadata: std::fs::Metadata,
+    source_metadata: std::fs::Metadata,
+    dest_metadata: Option<std::fs::Metadata>,
 }
 
-#[derive(Debug, Clone)]
-struct CopyTask {
-    source_path: PathBuf,
-    dest_path: PathBuf,
-    metadata: std::fs::Metadata,
-}
-
-#[derive(Debug, Clone)]
-struct MetadataTask {
-    dest_path: PathBuf,
-    metadata: std::fs::Metadata,
+impl FileTask {
+    // If the destination exists, then only consider the size. Otherwise flag for copy.
+    // Metadata will get set as a separate step.
+    fn needs_copy(&self) -> bool {
+        if let Some(dm) = &self.dest_metadata {
+            let sm = &self.source_metadata;
+            dm.len() != sm.len()
+        } else {
+            true
+        }
+    }
 }
 
 #[tokio::main]
@@ -57,8 +59,8 @@ async fn main() -> Result<()> {
     info!("Destination: {}", args.destination.display());
 
     let (discovery_tx, discovery_rx) = unbounded::<FileTask>();
-    let (comparison_tx, comparison_rx) = unbounded::<CopyTask>();
-    let (copy_tx, copy_rx) = unbounded::<MetadataTask>();
+    let (comparison_tx, comparison_rx) = unbounded::<FileTask>();
+    let (copy_tx, copy_rx) = unbounded::<FileTask>();
 
     let source = args.source.clone();
     let destination = args.destination.clone();
@@ -95,8 +97,6 @@ async fn discover_files(
     destination: PathBuf,
     tx: async_channel::Sender<FileTask>,
 ) -> Result<()> {
-    use tokio::fs as async_fs;
-
     /*
     if let Some(parent) = destination.parent() {
         async_fs::create_dir_all(parent).await?;
@@ -122,7 +122,8 @@ async fn discover_files(
                 .try_send(FileTask {
                     source_path: path.clone(),
                     dest_path: dest_path.clone(),
-                    metadata,
+                    source_metadata: metadata,
+                    dest_metadata: None,
                 })
                 .is_err()
             {
@@ -136,63 +137,33 @@ async fn discover_files(
 
 async fn compare_files(
     rx: async_channel::Receiver<FileTask>,
-    tx: async_channel::Sender<CopyTask>,
+    tx: async_channel::Sender<FileTask>,
 ) -> Result<()> {
-    use std::fs;
-    use tokio::fs as async_fs;
-
-    while let Ok(task) = rx.recv().await {
-        if task.metadata.is_dir() {
-            async_fs::create_dir_all(&task.dest_path).await?;
-
-            if tx
-                .send(CopyTask {
-                    source_path: task.source_path,
-                    dest_path: task.dest_path,
-                    metadata: task.metadata,
-                })
-                .await
-                .is_err()
-            {
-                break;
+    while let Ok(mut task) = rx.recv().await {
+        if let Ok(dest_metadata) = async_fs::metadata(&task.dest_path).await {
+            task.dest_metadata = Some(dest_metadata);
+            if !task.needs_copy() {
+                continue;
             }
-        } else {
-            let needs_copy = if let Ok(dest_metadata) = fs::metadata(&task.dest_path) {
-                task.metadata.len() != dest_metadata.len()
-                    || task.metadata.modified()? > dest_metadata.modified()?
-            } else {
-                true
-            };
-
-            if needs_copy {
-                if tx
-                    .send(CopyTask {
-                        source_path: task.source_path,
-                        dest_path: task.dest_path,
-                        metadata: task.metadata,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            } else {
-                // debug!("Skipping {:?} due to no change", task.source_path);
-            }
+        }
+        if tx.send(task).await.is_err() {
+            break;
         }
     }
     Ok(())
 }
 
 async fn copy_files(
-    rx: async_channel::Receiver<CopyTask>,
-    tx: async_channel::Sender<MetadataTask>,
+    rx: async_channel::Receiver<FileTask>,
+    tx: async_channel::Sender<FileTask>,
     dry_run: bool,
 ) -> Result<()> {
-    use tokio::fs as async_fs;
+    use std::fs;
 
-    while let Ok(task) = rx.recv().await {
-        if !task.metadata.is_dir() {
+    while let Ok(mut task) = rx.recv().await {
+        if task.source_metadata.is_dir() {
+            async_fs::create_dir_all(&task.dest_path).await?;
+        } else {
             if let Some(parent) = task.dest_path.parent() {
                 if !dry_run {
                     async_fs::create_dir_all(parent).await?;
@@ -202,43 +173,51 @@ async fn copy_files(
             info!("{:?}", task.dest_path);
             if !dry_run {
                 async_fs::copy(&task.source_path, &task.dest_path).await?;
+                task.dest_metadata = Some(fs::metadata(&task.dest_path).unwrap());
             }
         }
 
-        if tx
-            .send(MetadataTask {
-                dest_path: task.dest_path,
-                metadata: task.metadata,
-            })
-            .await
-            .is_err()
-        {
+        if tx.send(task).await.is_err() {
             break;
         }
     }
     Ok(())
 }
 
-async fn adjust_metadata(rx: async_channel::Receiver<MetadataTask>, dry_run: bool) -> Result<()> {
+async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -> Result<()> {
     use std::fs;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, chown};
 
     while let Ok(task) = rx.recv().await {
         if dry_run {
             continue;
         }
-        if let Ok(_dest_metadata) = fs::metadata(&task.dest_path) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
 
-                let permissions = fs::Permissions::from_mode(task.metadata.mode());
-                fs::set_permissions(&task.dest_path, permissions)?;
+            let sm = &task.source_metadata;
+            let dm = task.dest_metadata.as_ref().unwrap();
 
-                if let Ok(mtime) = task.metadata.modified() {
-                    let mtime = filetime::FileTime::from_system_time(mtime);
-                    filetime::set_file_mtime(&task.dest_path, mtime)?;
+            // Set permissions if necessary
+            if sm.mode() != dm.mode() {
+                let permissions = fs::Permissions::from_mode(sm.mode());
+                async_fs::set_permissions(&task.dest_path, permissions).await?;
+            }
+
+            // Set mtime
+            if let Ok(smtime) = sm.modified() {
+                if let Ok(dmtime) = dm.modified() {
+                    if smtime != dmtime {
+                        let mtime = filetime::FileTime::from_system_time(smtime);
+                        filetime::set_file_mtime(&task.dest_path, mtime)?;
+                    }
                 }
+            }
+
+            // set user
+            if sm.uid() != dm.uid() {
+                chown(task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
             }
         }
     }
