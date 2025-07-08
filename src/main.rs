@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { discover_files(source, destination, discovery_tx).await });
 
     let comparison_handle =
-        tokio::spawn(async move { compare_files(discovery_rx, comparison_tx).await });
+        tokio::spawn(async move { populate_dest_metadata(discovery_rx, comparison_tx).await });
 
     let copy_handles: Vec<_> = (0..parallelism)
         .map(|_| (comparison_rx.clone(), copy_tx.clone()))
@@ -135,16 +135,13 @@ async fn discover_files(
     Ok(())
 }
 
-async fn compare_files(
+async fn populate_dest_metadata(
     rx: async_channel::Receiver<FileTask>,
     tx: async_channel::Sender<FileTask>,
 ) -> Result<()> {
     while let Ok(mut task) = rx.recv().await {
         if let Ok(dest_metadata) = async_fs::metadata(&task.dest_path).await {
             task.dest_metadata = Some(dest_metadata);
-            if !task.needs_copy() {
-                continue;
-            }
         }
         if tx.send(task).await.is_err() {
             break;
@@ -162,7 +159,9 @@ async fn copy_files(
 
     while let Ok(mut task) = rx.recv().await {
         if task.source_metadata.is_dir() {
-            async_fs::create_dir_all(&task.dest_path).await?;
+            if !dry_run {
+                async_fs::create_dir_all(&task.dest_path).await?;
+            }
         } else {
             if let Some(parent) = task.dest_path.parent() {
                 if !dry_run {
@@ -172,7 +171,10 @@ async fn copy_files(
 
             info!("{:?}", task.dest_path);
             if !dry_run {
-                async_fs::copy(&task.source_path, &task.dest_path).await?;
+                if task.needs_copy() {
+                    async_fs::copy(&task.source_path, &task.dest_path).await?;
+                }
+                // Update the destination metadata
                 task.dest_metadata = Some(fs::metadata(&task.dest_path).unwrap());
             }
         }
