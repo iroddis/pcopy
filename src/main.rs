@@ -176,8 +176,8 @@ async fn compare_files(
                 true
             };
 
-            if needs_copy
-                && tx
+            if needs_copy {
+                if tx
                     .send(CopyTask {
                         source_path: task.source_path,
                         dest_path: task.dest_path,
@@ -185,8 +185,11 @@ async fn compare_files(
                     })
                     .await
                     .is_err()
-            {
-                break;
+                {
+                    break;
+                }
+            } else {
+                info!("Skipping {:?} due to no change", task.source_path);
             }
         }
     }
