@@ -1,7 +1,7 @@
 use anyhow::Result;
+use async_channel::unbounded;
 use clap::Parser;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 #[command(name = "pcopy")]
 #[command(about = "A parallel file copy tool mimicking rsync -ar for local copies")]
 struct Args {
-    #[arg(short, long, default_value = "1")]
+    #[arg(short, long, default_value = "10")]
     parallelism: usize,
 
     source: PathBuf,
@@ -53,13 +53,13 @@ async fn main() -> Result<()> {
     info!("Source: {}", args.source.display());
     info!("Destination: {}", args.destination.display());
 
-    let (discovery_tx, discovery_rx) = mpsc::channel::<FileTask>(1000);
-    let (comparison_tx, comparison_rx) = mpsc::channel::<CopyTask>(1000);
-    let (copy_tx, copy_rx) = mpsc::channel::<MetadataTask>(1000);
+    let (discovery_tx, discovery_rx) = unbounded::<FileTask>();
+    let (comparison_tx, comparison_rx) = unbounded::<CopyTask>();
+    let (copy_tx, copy_rx) = unbounded::<MetadataTask>();
 
     let source = args.source.clone();
     let destination = args.destination.clone();
-    let _parallelism = args.parallelism;
+    let parallelism = args.parallelism;
 
     let discovery_handle =
         tokio::spawn(async move { discover_files(source, destination, discovery_tx).await });
@@ -67,13 +67,19 @@ async fn main() -> Result<()> {
     let comparison_handle =
         tokio::spawn(async move { compare_files(discovery_rx, comparison_tx).await });
 
-    let copy_handle = tokio::spawn(async move { copy_files(comparison_rx, copy_tx).await });
+    let copy_handles: Vec<_> = (0..parallelism)
+        .map(|_| (comparison_rx.clone(), copy_tx.clone()))
+        .map(|(comp, copy)| tokio::spawn(async move { copy_files(comp, copy).await }))
+        .collect();
 
     let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx).await });
 
     discovery_handle.await??;
     comparison_handle.await??;
-    copy_handle.await??;
+    for ch in copy_handles {
+        ch.await??;
+    }
+    //copy_handle.await??;
     metadata_handle.await??;
 
     info!("pcopy completed successfully");
@@ -83,7 +89,7 @@ async fn main() -> Result<()> {
 async fn discover_files(
     source: PathBuf,
     destination: PathBuf,
-    tx: mpsc::Sender<FileTask>,
+    tx: async_channel::Sender<FileTask>,
 ) -> Result<()> {
     use std::fs;
     use tokio::fs as async_fs;
@@ -92,7 +98,7 @@ async fn discover_files(
         source: &PathBuf,
         destination: &PathBuf,
         current: &PathBuf,
-        tx: &mpsc::Sender<FileTask>,
+        tx: &async_channel::Sender<FileTask>,
     ) -> Result<()> {
         let entries = fs::read_dir(current)?;
 
@@ -140,11 +146,14 @@ async fn discover_files(
     Ok(())
 }
 
-async fn compare_files(mut rx: mpsc::Receiver<FileTask>, tx: mpsc::Sender<CopyTask>) -> Result<()> {
+async fn compare_files(
+    rx: async_channel::Receiver<FileTask>,
+    tx: async_channel::Sender<CopyTask>,
+) -> Result<()> {
     use std::fs;
     use tokio::fs as async_fs;
 
-    while let Some(task) = rx.recv().await {
+    while let Ok(task) = rx.recv().await {
         if task.metadata.is_dir() {
             async_fs::create_dir_all(&task.dest_path).await?;
 
@@ -185,12 +194,12 @@ async fn compare_files(mut rx: mpsc::Receiver<FileTask>, tx: mpsc::Sender<CopyTa
 }
 
 async fn copy_files(
-    mut rx: mpsc::Receiver<CopyTask>,
-    tx: mpsc::Sender<MetadataTask>,
+    rx: async_channel::Receiver<CopyTask>,
+    tx: async_channel::Sender<MetadataTask>,
 ) -> Result<()> {
     use tokio::fs as async_fs;
 
-    while let Some(task) = rx.recv().await {
+    while let Ok(task) = rx.recv().await {
         if !task.metadata.is_dir() {
             if let Some(parent) = task.dest_path.parent() {
                 async_fs::create_dir_all(parent).await?;
@@ -213,11 +222,11 @@ async fn copy_files(
     Ok(())
 }
 
-async fn adjust_metadata(mut rx: mpsc::Receiver<MetadataTask>) -> Result<()> {
+async fn adjust_metadata(rx: async_channel::Receiver<MetadataTask>) -> Result<()> {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
 
-    while let Some(task) = rx.recv().await {
+    while let Ok(task) = rx.recv().await {
         if let Ok(_dest_metadata) = fs::metadata(&task.dest_path) {
             #[cfg(unix)]
             {
