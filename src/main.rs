@@ -169,9 +169,9 @@ async fn copy_files(
                 }
             }
 
-            info!("{:?}", task.dest_path);
             if !dry_run {
                 if task.needs_copy() {
+                    info!("copying {:?}", &task.dest_path);
                     async_fs::copy(&task.source_path, &task.dest_path).await?;
                 }
                 // Update the destination metadata
@@ -197,6 +197,7 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mut changed = false;
 
             let sm = &task.source_metadata;
             let dm = task.dest_metadata.as_ref().unwrap();
@@ -205,6 +206,7 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
             if sm.mode() != dm.mode() {
                 let permissions = fs::Permissions::from_mode(sm.mode());
                 async_fs::set_permissions(&task.dest_path, permissions).await?;
+                changed = true;
             }
 
             // Set mtime
@@ -213,13 +215,19 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
                     if smtime != dmtime {
                         let mtime = filetime::FileTime::from_system_time(smtime);
                         filetime::set_file_mtime(&task.dest_path, mtime)?;
+                        changed = true;
                     }
                 }
             }
 
             // set user
             if sm.uid() != dm.uid() {
-                chown(task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
+                chown(&task.dest_path, Some(sm.uid()), Some(sm.gid()))?;
+                changed = true;
+            }
+
+            if changed {
+                info!("set attrs: {:?}", &task.dest_path);
             }
         }
     }
