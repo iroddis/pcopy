@@ -95,41 +95,33 @@ async fn discover_files(
     destination: PathBuf,
     tx: async_channel::Sender<FileTask>,
 ) -> Result<()> {
-    use std::fs;
     use tokio::fs as async_fs;
 
-    fn walk_dir(
-        source: &PathBuf,
-        destination: &PathBuf,
-        current: &PathBuf,
-        tx: &async_channel::Sender<FileTask>,
-    ) -> Result<()> {
-        let entries = fs::read_dir(current)?;
+    /*
+    if let Some(parent) = destination.parent() {
+        async_fs::create_dir_all(parent).await?;
+    }
+    */
 
-        for entry in entries {
-            let entry = entry?;
+    info!("Starting file discovery");
+    let mut dirs = vec![source.clone()];
+    while let Some(current) = dirs.pop() {
+        let mut entries = async_fs::read_dir(current).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            let metadata = entry.metadata()?;
+            let metadata = entry.metadata().await?;
 
-            let relative_path = path.strip_prefix(source)?;
+            let relative_path = path.strip_prefix(&source)?;
             let dest_path = destination.join(relative_path);
 
             if metadata.is_dir() {
-                if tx
-                    .try_send(FileTask {
-                        source_path: path.clone(),
-                        dest_path: dest_path.clone(),
-                        metadata,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                walk_dir(source, destination, &path, tx)?;
-            } else if tx
+                dirs.push(path.clone());
+            }
+            if tx
                 .try_send(FileTask {
-                    source_path: path,
-                    dest_path,
+                    source_path: path.clone(),
+                    dest_path: dest_path.clone(),
                     metadata,
                 })
                 .is_err()
@@ -137,15 +129,7 @@ async fn discover_files(
                 break;
             }
         }
-        Ok(())
     }
-
-    if let Some(parent) = destination.parent() {
-        async_fs::create_dir_all(parent).await?;
-    }
-
-    info!("Starting file discovery");
-    walk_dir(&source, &destination, &source, &tx)?;
     info!("File discovery completed");
     Ok(())
 }
