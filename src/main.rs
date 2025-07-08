@@ -15,6 +15,7 @@ struct Args {
     source: PathBuf,
     destination: PathBuf,
 
+    #[arg(long)]
     dry_run: bool,
 }
 
