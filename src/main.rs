@@ -80,12 +80,16 @@ async fn main() -> Result<()> {
 
     let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx, dry_run).await });
 
+    info!("Waiting on file discovery");
     discovery_handle.await??;
+    info!("Waiting on comparison");
     comparison_handle.await??;
+    info!("Waiting on copier");
     for ch in copy_handles {
         ch.await??;
     }
     //copy_handle.await??;
+    info!("Waiting on metadata updater");
     metadata_handle.await??;
 
     info!("pcopy completed successfully");
@@ -230,7 +234,7 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
             }
 
             if changed {
-                info!("set attrs: {:?}", &task.dest_path);
+                // info!("set attrs: {:?}", &task.dest_path);
             }
         }
     }
