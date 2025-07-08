@@ -78,7 +78,12 @@ async fn main() -> Result<()> {
         .map(|(comp, copy)| tokio::spawn(async move { copy_files(comp, copy, dry_run).await }))
         .collect();
 
-    let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx, dry_run).await });
+    let md_handles: Vec<_> = (0..parallelism)
+        .map(|_| copy_rx.clone())
+        .map(|c_rx| tokio::spawn(async move { adjust_metadata(c_rx, dry_run).await }))
+        .collect();
+
+    //let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx, dry_run).await });
 
     info!("Waiting on file discovery");
     discovery_handle.await??;
@@ -88,9 +93,14 @@ async fn main() -> Result<()> {
     for ch in copy_handles {
         ch.await??;
     }
+    copy_tx.close();
     //copy_handle.await??;
     info!("Waiting on metadata updater");
-    metadata_handle.await??;
+    //metadata_handle.await??;
+    for ch in md_handles {
+        ch.await??;
+    }
+    // md_handles.iter().map(|ch| ch.await??);
 
     info!("pcopy completed successfully");
     Ok(())
