@@ -24,6 +24,12 @@ struct Args {
 
     #[arg(long)]
     progress: bool,
+
+    #[arg(long)]
+    verbose: bool,
+
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +71,11 @@ impl ProgressCounter {
         let copied = self.copied.load(Ordering::Relaxed);
         let bytes = self.bytes_copied.load(Ordering::Relaxed);
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.0 { bytes as f64 / elapsed } else { 0.0 };
+        let speed = if elapsed > 0.0 {
+            bytes as f64 / elapsed
+        } else {
+            0.0
+        };
         (discovered, flagged, copied, bytes, speed)
     }
 }
@@ -75,18 +85,20 @@ async fn progress_display_task(progress: ProgressCounter) -> Result<()> {
     loop {
         interval.tick().await;
         let (discovered, flagged, copied, bytes, speed) = progress.get_stats();
-        
+
         // Format bytes nicely
         let bytes_str = format_bytes(bytes);
         let speed_str = format_bytes(speed as u64);
-        
+
         // Clear line and print progress
         print!("\r\x1b[2K"); // Clear current line
-        print!("Discovered: {} | Flagged: {} | Copied: {} | Size: {} | Speed: {}/s",
-               discovered, flagged, copied, bytes_str, speed_str);
+        print!(
+            "Discovered: {} | Flagged: {} | Copied: {} | Size: {} | Speed: {}/s",
+            discovered, flagged, copied, bytes_str, speed_str
+        );
         use std::io::{self, Write};
         io::stdout().flush().unwrap();
-        
+
         // If we're done (no more discovery happening), we can exit
         // For now, we'll just continue indefinitely
     }
@@ -96,12 +108,12 @@ fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
-    
+
     while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
         size /= 1024.0;
         unit_idx += 1;
     }
-    
+
     if unit_idx == 0 {
         format!("{} {}", size as u64, UNITS[unit_idx])
     } else {
@@ -131,11 +143,7 @@ impl FileTask {
     }
 
     // Transform symlink target path for absolute links
-    fn transform_symlink_target(
-        &self,
-        source_root: &Path,
-        dest_root: &Path,
-    ) -> Option<PathBuf> {
+    fn transform_symlink_target(&self, source_root: &Path, dest_root: &Path) -> Option<PathBuf> {
         if let Some(target) = &self.symlink_target {
             if target.is_absolute() {
                 // For absolute symlinks, check if they point within the source tree
@@ -165,16 +173,22 @@ impl FileTask {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     let args = Args::parse();
 
     if !args.source.exists() {
         anyhow::bail!("Source path does not exist: {}", args.source.display());
     }
+
+    let log_level = if args.verbose {
+        Level::INFO
+    } else if args.debug {
+        Level::DEBUG
+    } else {
+        Level::WARN
+    };
+
+    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting pcopy with parallelism: {}", args.parallelism);
     info!("Source: {}", args.source.display());
@@ -198,12 +212,16 @@ async fn main() -> Result<()> {
 
     let discovery_handle = {
         let progress = progress_counter.clone();
-        tokio::spawn(async move { discover_files(source, destination, discovery_tx, progress).await })
+        tokio::spawn(
+            async move { discover_files(source, destination, discovery_tx, progress).await },
+        )
     };
 
     let comparison_handle = {
         let progress = progress_counter.clone();
-        tokio::spawn(async move { populate_dest_metadata(discovery_rx, comparison_tx, progress).await })
+        tokio::spawn(
+            async move { populate_dest_metadata(discovery_rx, comparison_tx, progress).await },
+        )
     };
 
     let copy_handles: Vec<_> = (0..parallelism)
@@ -230,7 +248,9 @@ async fn main() -> Result<()> {
 
     // Start progress display if requested
     let progress_handle = if let Some(progress) = progress_counter.clone() {
-        Some(tokio::spawn(async move { progress_display_task(progress).await }))
+        Some(tokio::spawn(async move {
+            progress_display_task(progress).await
+        }))
     } else {
         None
     };
@@ -303,7 +323,7 @@ async fn discover_files(
             if let Some(ref progress) = progress {
                 progress.increment_discovered();
             }
-            
+
             if tx
                 .try_send(FileTask {
                     source_path: path.clone(),
@@ -331,14 +351,14 @@ async fn populate_dest_metadata(
         if let Ok(dest_metadata) = async_fs::metadata(&task.dest_path).await {
             task.dest_metadata = Some(dest_metadata);
         }
-        
+
         // Check if this task needs copying and update progress
         if task.needs_copy() {
             if let Some(ref progress) = progress {
                 progress.increment_flagged();
             }
         }
-        
+
         if tx.send(task).await.is_err() {
             break;
         }
@@ -410,7 +430,7 @@ async fn copy_files(
                 if let Ok(dm) = fs::symlink_metadata(&task.dest_path) {
                     task.dest_metadata = Some(dm);
                 }
-                
+
                 // Count symlink creation as copying
                 if let Some(ref progress) = progress {
                     progress.increment_copied(0);
@@ -427,7 +447,7 @@ async fn copy_files(
                 if task.needs_copy() {
                     info!("copying {:?}", &task.dest_path);
                     async_fs::copy(&task.source_path, &task.dest_path).await?;
-                    
+
                     // Count file copying with size
                     if let Some(ref progress) = progress {
                         progress.increment_copied(task.source_metadata.len());
@@ -534,13 +554,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_file = temp_dir.path().join("source.txt");
         fs::write(&source_file, "test content").unwrap();
-        
-        let task = create_test_file_task(
-            source_file,
-            temp_dir.path().join("dest.txt"),
-            None,
-        );
-        
+
+        let task = create_test_file_task(source_file, temp_dir.path().join("dest.txt"), None);
+
         assert!(task.needs_copy());
     }
 
@@ -549,14 +565,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_file = temp_dir.path().join("source.txt");
         let dest_file = temp_dir.path().join("dest.txt");
-        
+
         fs::write(&source_file, "test content").unwrap();
         fs::write(&dest_file, "test content").unwrap();
-        
+
         let dest_metadata = fs::metadata(&dest_file).unwrap();
         let mut task = create_test_file_task(source_file, dest_file, None);
         task.dest_metadata = Some(dest_metadata);
-        
+
         assert!(!task.needs_copy());
     }
 
@@ -565,14 +581,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_file = temp_dir.path().join("source.txt");
         let dest_file = temp_dir.path().join("dest.txt");
-        
+
         fs::write(&source_file, "test content longer").unwrap();
         fs::write(&dest_file, "test content").unwrap();
-        
+
         let dest_metadata = fs::metadata(&dest_file).unwrap();
         let mut task = create_test_file_task(source_file, dest_file, None);
         task.dest_metadata = Some(dest_metadata);
-        
+
         assert!(task.needs_copy());
     }
 
@@ -581,19 +597,19 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_file = temp_dir.path().join("source.txt");
         let target_file = temp_dir.path().join("target.txt");
-        
+
         fs::write(&target_file, "target content").unwrap();
         symlink("./target.txt", &source_file).unwrap();
-        
+
         let task = create_test_file_task(
             source_file,
             temp_dir.path().join("dest.txt"),
             Some(PathBuf::from("./target.txt")),
         );
-        
+
         let source_root = temp_dir.path().join("source");
         let dest_root = temp_dir.path().join("dest");
-        
+
         let transformed = task.transform_symlink_target(&source_root, &dest_root);
         assert_eq!(transformed, Some(PathBuf::from("./target.txt")));
     }
@@ -603,27 +619,30 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_root = temp_dir.path().join("source");
         let dest_root = temp_dir.path().join("dest");
-        
+
         fs::create_dir_all(&source_root).unwrap();
         fs::create_dir_all(&dest_root).unwrap();
-        
+
         let source_root = source_root.canonicalize().unwrap();
-        
+
         let target_file = source_root.join("subdir").join("target.txt");
         fs::create_dir_all(target_file.parent().unwrap()).unwrap();
         fs::write(&target_file, "target content").unwrap();
-        
+
         let source_file = source_root.join("source.txt");
         symlink(&target_file, &source_file).unwrap();
-        
+
         let task = create_test_file_task(
             source_file,
             dest_root.join("dest.txt"),
             Some(target_file.clone()),
         );
-        
+
         let transformed = task.transform_symlink_target(&source_root, &dest_root);
-        assert_eq!(transformed, Some(dest_root.join("subdir").join("target.txt")));
+        assert_eq!(
+            transformed,
+            Some(dest_root.join("subdir").join("target.txt"))
+        );
     }
 
     #[test]
@@ -631,21 +650,21 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_root = temp_dir.path().join("source");
         let dest_root = temp_dir.path().join("dest");
-        
+
         fs::create_dir_all(&source_root).unwrap();
-        
+
         let external_target = PathBuf::from("/etc/passwd");
         let source_file = source_root.join("source.txt");
-        
+
         // Create a dummy file since we can't actually symlink to /etc/passwd in tests
         fs::write(&source_file, "dummy").unwrap();
-        
+
         let task = create_test_file_task(
             source_file,
             dest_root.join("dest.txt"),
             Some(external_target.clone()),
         );
-        
+
         let transformed = task.transform_symlink_target(&source_root, &dest_root);
         assert_eq!(transformed, Some(external_target));
     }
@@ -655,16 +674,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_file = temp_dir.path().join("source.txt");
         fs::write(&source_file, "regular file").unwrap();
-        
-        let task = create_test_file_task(
-            source_file,
-            temp_dir.path().join("dest.txt"),
-            None,
-        );
-        
+
+        let task = create_test_file_task(source_file, temp_dir.path().join("dest.txt"), None);
+
         let source_root = temp_dir.path().join("source");
         let dest_root = temp_dir.path().join("dest");
-        
+
         let transformed = task.transform_symlink_target(&source_root, &dest_root);
         assert_eq!(transformed, None);
     }
@@ -674,48 +689,60 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_dir = temp_dir.path().join("source");
         let dest_dir = temp_dir.path().join("dest");
-        
+
         fs::create_dir_all(&source_dir).unwrap();
-        
+
         // Create a regular file
         let regular_file = source_dir.join("regular.txt");
         fs::write(&regular_file, "regular content").unwrap();
-        
+
         // Create a relative symlink
         let rel_symlink = source_dir.join("rel_link.txt");
         symlink("./regular.txt", &rel_symlink).unwrap();
-        
+
         // Create a target file for absolute symlink
         let abs_target = source_dir.join("abs_target.txt");
         fs::write(&abs_target, "abs target content").unwrap();
-        
+
         // Create absolute symlink
         let abs_symlink = source_dir.join("abs_link.txt");
         symlink(&abs_target, &abs_symlink).unwrap();
-        
+
         let (tx, rx) = unbounded::<FileTask>();
-        
+
         let discover_result = discover_files(source_dir, dest_dir, tx, None).await;
         assert!(discover_result.is_ok());
-        
+
         let mut tasks = Vec::new();
         while let Ok(task) = rx.try_recv() {
             tasks.push(task);
         }
-        
+
         // Should have 4 tasks: regular file, rel symlink, abs target, abs symlink
         assert_eq!(tasks.len(), 4);
-        
+
         // Check that symlinks have their targets recorded
-        let symlink_tasks: Vec<_> = tasks.iter().filter(|t| t.symlink_target.is_some()).collect();
+        let symlink_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.symlink_target.is_some())
+            .collect();
         assert_eq!(symlink_tasks.len(), 2);
-        
+
         // Check relative symlink
-        let rel_task = tasks.iter().find(|t| t.source_path.file_name().unwrap() == "rel_link.txt").unwrap();
-        assert_eq!(rel_task.symlink_target, Some(PathBuf::from("./regular.txt")));
-        
+        let rel_task = tasks
+            .iter()
+            .find(|t| t.source_path.file_name().unwrap() == "rel_link.txt")
+            .unwrap();
+        assert_eq!(
+            rel_task.symlink_target,
+            Some(PathBuf::from("./regular.txt"))
+        );
+
         // Check absolute symlink
-        let abs_task = tasks.iter().find(|t| t.source_path.file_name().unwrap() == "abs_link.txt").unwrap();
+        let abs_task = tasks
+            .iter()
+            .find(|t| t.source_path.file_name().unwrap() == "abs_link.txt")
+            .unwrap();
         assert!(abs_task.symlink_target.is_some());
         assert!(abs_task.symlink_target.as_ref().unwrap().is_absolute());
     }
@@ -725,18 +752,18 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_dir = temp_dir.path().join("source");
         let dest_dir = temp_dir.path().join("dest");
-        
+
         fs::create_dir_all(&source_dir).unwrap();
         fs::create_dir_all(&dest_dir).unwrap();
-        
+
         // Create target file
         let target_file = source_dir.join("target.txt");
         fs::write(&target_file, "target content").unwrap();
-        
+
         // Create symlink
         let symlink_file = source_dir.join("link.txt");
         symlink("./target.txt", &symlink_file).unwrap();
-        
+
         // Create FileTask for the symlink
         let symlink_metadata = fs::symlink_metadata(&symlink_file).unwrap();
         let task = FileTask {
@@ -746,24 +773,25 @@ mod tests {
             dest_metadata: None,
             symlink_target: Some(PathBuf::from("./target.txt")),
         };
-        
+
         let (task_tx, task_rx) = unbounded::<FileTask>();
         let (copy_tx, copy_rx) = unbounded::<FileTask>();
-        
+
         task_tx.send(task).await.unwrap();
         task_tx.close();
-        
-        let copy_result = copy_files(task_rx, copy_tx, false, source_dir, dest_dir.clone(), None).await;
+
+        let copy_result =
+            copy_files(task_rx, copy_tx, false, source_dir, dest_dir.clone(), None).await;
         assert!(copy_result.is_ok());
-        
+
         // Verify symlink was created
         let dest_link = dest_dir.join("link.txt");
         assert!(dest_link.is_symlink());
-        
+
         // Verify symlink target is correct
         let link_target = fs::read_link(&dest_link).unwrap();
         assert_eq!(link_target, PathBuf::from("./target.txt"));
-        
+
         // Verify a task was sent to the next stage
         let copied_task = copy_rx.try_recv().unwrap();
         assert!(copied_task.dest_metadata.is_some());
@@ -774,14 +802,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_dir = temp_dir.path().join("source");
         let dest_dir = temp_dir.path().join("dest");
-        
+
         fs::create_dir_all(&source_dir).unwrap();
         fs::create_dir_all(&dest_dir).unwrap();
-        
+
         // Create symlink
         let symlink_file = source_dir.join("link.txt");
         symlink("./target.txt", &symlink_file).unwrap();
-        
+
         let symlink_metadata = fs::symlink_metadata(&symlink_file).unwrap();
         let task = FileTask {
             source_path: symlink_file,
@@ -790,20 +818,21 @@ mod tests {
             dest_metadata: None,
             symlink_target: Some(PathBuf::from("./target.txt")),
         };
-        
+
         let (task_tx, task_rx) = unbounded::<FileTask>();
         let (copy_tx, copy_rx) = unbounded::<FileTask>();
-        
+
         task_tx.send(task).await.unwrap();
         task_tx.close();
-        
-        let copy_result = copy_files(task_rx, copy_tx, true, source_dir, dest_dir.clone(), None).await;
+
+        let copy_result =
+            copy_files(task_rx, copy_tx, true, source_dir, dest_dir.clone(), None).await;
         assert!(copy_result.is_ok());
-        
+
         // Verify symlink was NOT created in dry run
         let dest_link = dest_dir.join("link.txt");
         assert!(!dest_link.exists());
-        
+
         // Verify task was still sent to next stage
         let copied_task = copy_rx.try_recv().unwrap();
         assert!(copied_task.dest_metadata.is_none()); // No metadata in dry run
@@ -814,31 +843,31 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_root = temp_dir.path().join("source");
         let dest_root = temp_dir.path().join("dest");
-        
+
         // Test with empty symlink target
         let source_file = temp_dir.path().join("source.txt");
         fs::write(&source_file, "dummy").unwrap();
-        
+
         let task = create_test_file_task(
             source_file,
             temp_dir.path().join("dest.txt"),
             Some(PathBuf::from("")),
         );
-        
+
         let transformed = task.transform_symlink_target(&source_root, &dest_root);
         assert_eq!(transformed, Some(PathBuf::from("")));
-        
+
         // Test with complex relative path
         let complex_rel = PathBuf::from("../../../some/deep/path");
         let source_file2 = temp_dir.path().join("source2.txt");
         fs::write(&source_file2, "dummy").unwrap();
-        
+
         let task2 = create_test_file_task(
             source_file2,
             temp_dir.path().join("dest2.txt"),
             Some(complex_rel.clone()),
         );
-        
+
         let transformed2 = task2.transform_symlink_target(&source_root, &dest_root);
         assert_eq!(transformed2, Some(complex_rel));
     }
@@ -846,21 +875,21 @@ mod tests {
     #[test]
     fn test_progress_counter() {
         let progress = ProgressCounter::new();
-        
+
         // Test initial state
         let (discovered, flagged, copied, bytes, _speed) = progress.get_stats();
         assert_eq!(discovered, 0);
         assert_eq!(flagged, 0);
         assert_eq!(copied, 0);
         assert_eq!(bytes, 0);
-        
+
         // Test increments
         progress.increment_discovered();
         progress.increment_discovered();
         progress.increment_flagged();
         progress.increment_copied(100);
         progress.increment_copied(200);
-        
+
         let (discovered, flagged, copied, bytes, _speed) = progress.get_stats();
         assert_eq!(discovered, 2);
         assert_eq!(flagged, 1);
@@ -884,31 +913,32 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let source_dir = temp_dir.path().join("source");
         let dest_dir = temp_dir.path().join("dest");
-        
+
         fs::create_dir_all(&source_dir).unwrap();
-        
+
         // Create test files
         let file1 = source_dir.join("file1.txt");
         let file2 = source_dir.join("file2.txt");
         fs::write(&file1, "content1").unwrap();
         fs::write(&file2, "content2").unwrap();
-        
+
         let progress = ProgressCounter::new();
         let (tx, rx) = unbounded::<FileTask>();
-        
+
         // Test discovery with progress
-        let discover_result = discover_files(source_dir, dest_dir, tx, Some(progress.clone())).await;
+        let discover_result =
+            discover_files(source_dir, dest_dir, tx, Some(progress.clone())).await;
         assert!(discover_result.is_ok());
-        
+
         // Check that files were discovered
         let (discovered, _flagged, _copied, _bytes, _speed) = progress.get_stats();
         assert_eq!(discovered, 2);
-        
+
         // Test flagging with progress
         let (comp_tx, _comp_rx) = unbounded::<FileTask>();
         let populate_result = populate_dest_metadata(rx, comp_tx, Some(progress.clone())).await;
         assert!(populate_result.is_ok());
-        
+
         // Check that files were flagged for copying (since dest doesn't exist)
         let (_discovered, flagged, _copied, _bytes, _speed) = progress.get_stats();
         assert_eq!(flagged, 2);
