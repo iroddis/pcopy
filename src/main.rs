@@ -2,6 +2,9 @@ use anyhow::Result;
 use async_channel::unbounded;
 use clap::Parser;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::fs as async_fs;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -18,6 +21,92 @@ struct Args {
 
     #[arg(long)]
     dry_run: bool,
+
+    #[arg(long)]
+    progress: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressCounter {
+    discovered: Arc<AtomicU64>,
+    flagged_for_copy: Arc<AtomicU64>,
+    copied: Arc<AtomicU64>,
+    bytes_copied: Arc<AtomicU64>,
+    start_time: Instant,
+}
+
+impl ProgressCounter {
+    fn new() -> Self {
+        Self {
+            discovered: Arc::new(AtomicU64::new(0)),
+            flagged_for_copy: Arc::new(AtomicU64::new(0)),
+            copied: Arc::new(AtomicU64::new(0)),
+            bytes_copied: Arc::new(AtomicU64::new(0)),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn increment_discovered(&self) {
+        self.discovered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_flagged(&self) {
+        self.flagged_for_copy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_copied(&self, bytes: u64) {
+        self.copied.fetch_add(1, Ordering::Relaxed);
+        self.bytes_copied.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn get_stats(&self) -> (u64, u64, u64, u64, f64) {
+        let discovered = self.discovered.load(Ordering::Relaxed);
+        let flagged = self.flagged_for_copy.load(Ordering::Relaxed);
+        let copied = self.copied.load(Ordering::Relaxed);
+        let bytes = self.bytes_copied.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 { bytes as f64 / elapsed } else { 0.0 };
+        (discovered, flagged, copied, bytes, speed)
+    }
+}
+
+async fn progress_display_task(progress: ProgressCounter) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        interval.tick().await;
+        let (discovered, flagged, copied, bytes, speed) = progress.get_stats();
+        
+        // Format bytes nicely
+        let bytes_str = format_bytes(bytes);
+        let speed_str = format_bytes(speed as u64);
+        
+        // Clear line and print progress
+        print!("\r\x1b[2K"); // Clear current line
+        print!("Discovered: {} | Flagged: {} | Copied: {} | Size: {} | Speed: {}/s",
+               discovered, flagged, copied, bytes_str, speed_str);
+        use std::io::{self, Write};
+        io::stdout().flush().unwrap();
+        
+        // If we're done (no more discovery happening), we can exit
+        // For now, we'll just continue indefinitely
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+    
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+    
+    if unit_idx == 0 {
+        format!("{} {}", size as u64, UNITS[unit_idx])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_idx])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,12 +188,23 @@ async fn main() -> Result<()> {
     let destination = args.destination.clone();
     let parallelism = args.parallelism;
     let dry_run = args.dry_run;
+    let show_progress = args.progress;
 
-    let discovery_handle =
-        tokio::spawn(async move { discover_files(source, destination, discovery_tx).await });
+    let progress_counter = if show_progress {
+        Some(ProgressCounter::new())
+    } else {
+        None
+    };
 
-    let comparison_handle =
-        tokio::spawn(async move { populate_dest_metadata(discovery_rx, comparison_tx).await });
+    let discovery_handle = {
+        let progress = progress_counter.clone();
+        tokio::spawn(async move { discover_files(source, destination, discovery_tx, progress).await })
+    };
+
+    let comparison_handle = {
+        let progress = progress_counter.clone();
+        tokio::spawn(async move { populate_dest_metadata(discovery_rx, comparison_tx, progress).await })
+    };
 
     let copy_handles: Vec<_> = (0..parallelism)
         .map(|_| {
@@ -113,10 +213,11 @@ async fn main() -> Result<()> {
                 copy_tx.clone(),
                 args.source.clone(),
                 args.destination.clone(),
+                progress_counter.clone(),
             )
         })
-        .map(|(comp, copy, src, dest)| {
-            tokio::spawn(async move { copy_files(comp, copy, dry_run, src, dest).await })
+        .map(|(comp, copy, src, dest, progress)| {
+            tokio::spawn(async move { copy_files(comp, copy, dry_run, src, dest, progress).await })
         })
         .collect();
 
@@ -126,6 +227,13 @@ async fn main() -> Result<()> {
         .collect();
 
     //let metadata_handle = tokio::spawn(async move { adjust_metadata(copy_rx, dry_run).await });
+
+    // Start progress display if requested
+    let progress_handle = if let Some(progress) = progress_counter.clone() {
+        Some(tokio::spawn(async move { progress_display_task(progress).await }))
+    } else {
+        None
+    };
 
     info!("Waiting on file discovery");
     discovery_handle.await??;
@@ -144,6 +252,15 @@ async fn main() -> Result<()> {
     }
     // md_handles.iter().map(|ch| ch.await??);
 
+    // Clean up progress display
+    if let Some(handle) = progress_handle {
+        handle.abort();
+        if show_progress {
+            // Print final newline to clear progress line
+            println!();
+        }
+    }
+
     info!("pcopy completed successfully");
     Ok(())
 }
@@ -152,6 +269,7 @@ async fn discover_files(
     source: PathBuf,
     destination: PathBuf,
     tx: async_channel::Sender<FileTask>,
+    progress: Option<ProgressCounter>,
 ) -> Result<()> {
     /*
     if let Some(parent) = destination.parent() {
@@ -182,6 +300,10 @@ async fn discover_files(
                 None
             };
 
+            if let Some(ref progress) = progress {
+                progress.increment_discovered();
+            }
+            
             if tx
                 .try_send(FileTask {
                     source_path: path.clone(),
@@ -203,11 +325,20 @@ async fn discover_files(
 async fn populate_dest_metadata(
     rx: async_channel::Receiver<FileTask>,
     tx: async_channel::Sender<FileTask>,
+    progress: Option<ProgressCounter>,
 ) -> Result<()> {
     while let Ok(mut task) = rx.recv().await {
         if let Ok(dest_metadata) = async_fs::metadata(&task.dest_path).await {
             task.dest_metadata = Some(dest_metadata);
         }
+        
+        // Check if this task needs copying and update progress
+        if task.needs_copy() {
+            if let Some(ref progress) = progress {
+                progress.increment_flagged();
+            }
+        }
+        
         if tx.send(task).await.is_err() {
             break;
         }
@@ -221,6 +352,7 @@ async fn copy_files(
     dry_run: bool,
     source_root: PathBuf,
     dest_root: PathBuf,
+    progress: Option<ProgressCounter>,
 ) -> Result<()> {
     use std::fs;
 
@@ -228,6 +360,10 @@ async fn copy_files(
         if task.source_metadata.is_dir() {
             if !dry_run {
                 async_fs::create_dir_all(&task.dest_path).await?;
+            }
+            // Count directory creation as copying
+            if let Some(ref progress) = progress {
+                progress.increment_copied(0);
             }
         } else if task.source_metadata.is_symlink() {
             // Handle symlinks
@@ -274,6 +410,11 @@ async fn copy_files(
                 if let Ok(dm) = fs::symlink_metadata(&task.dest_path) {
                     task.dest_metadata = Some(dm);
                 }
+                
+                // Count symlink creation as copying
+                if let Some(ref progress) = progress {
+                    progress.increment_copied(0);
+                }
             }
         } else {
             if let Some(parent) = task.dest_path.parent() {
@@ -286,10 +427,20 @@ async fn copy_files(
                 if task.needs_copy() {
                     info!("copying {:?}", &task.dest_path);
                     async_fs::copy(&task.source_path, &task.dest_path).await?;
+                    
+                    // Count file copying with size
+                    if let Some(ref progress) = progress {
+                        progress.increment_copied(task.source_metadata.len());
+                    }
                 }
                 // Update the destination metadata
                 if let Ok(dm) = fs::metadata(&task.dest_path) {
                     task.dest_metadata = Some(dm);
+                }
+            } else if task.needs_copy() {
+                // In dry run mode, still count what would be copied
+                if let Some(ref progress) = progress {
+                    progress.increment_copied(task.source_metadata.len());
                 }
             }
         }
@@ -544,7 +695,7 @@ mod tests {
         
         let (tx, rx) = unbounded::<FileTask>();
         
-        let discover_result = discover_files(source_dir, dest_dir, tx).await;
+        let discover_result = discover_files(source_dir, dest_dir, tx, None).await;
         assert!(discover_result.is_ok());
         
         let mut tasks = Vec::new();
@@ -602,7 +753,7 @@ mod tests {
         task_tx.send(task).await.unwrap();
         task_tx.close();
         
-        let copy_result = copy_files(task_rx, copy_tx, false, source_dir, dest_dir.clone()).await;
+        let copy_result = copy_files(task_rx, copy_tx, false, source_dir, dest_dir.clone(), None).await;
         assert!(copy_result.is_ok());
         
         // Verify symlink was created
@@ -646,7 +797,7 @@ mod tests {
         task_tx.send(task).await.unwrap();
         task_tx.close();
         
-        let copy_result = copy_files(task_rx, copy_tx, true, source_dir, dest_dir.clone()).await;
+        let copy_result = copy_files(task_rx, copy_tx, true, source_dir, dest_dir.clone(), None).await;
         assert!(copy_result.is_ok());
         
         // Verify symlink was NOT created in dry run
@@ -690,5 +841,76 @@ mod tests {
         
         let transformed2 = task2.transform_symlink_target(&source_root, &dest_root);
         assert_eq!(transformed2, Some(complex_rel));
+    }
+
+    #[test]
+    fn test_progress_counter() {
+        let progress = ProgressCounter::new();
+        
+        // Test initial state
+        let (discovered, flagged, copied, bytes, _speed) = progress.get_stats();
+        assert_eq!(discovered, 0);
+        assert_eq!(flagged, 0);
+        assert_eq!(copied, 0);
+        assert_eq!(bytes, 0);
+        
+        // Test increments
+        progress.increment_discovered();
+        progress.increment_discovered();
+        progress.increment_flagged();
+        progress.increment_copied(100);
+        progress.increment_copied(200);
+        
+        let (discovered, flagged, copied, bytes, _speed) = progress.get_stats();
+        assert_eq!(discovered, 2);
+        assert_eq!(flagged, 1);
+        assert_eq!(copied, 2);
+        assert_eq!(bytes, 300);
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.0 TB");
+    }
+
+    #[tokio::test]
+    async fn test_progress_integration() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        let dest_dir = temp_dir.path().join("dest");
+        
+        fs::create_dir_all(&source_dir).unwrap();
+        
+        // Create test files
+        let file1 = source_dir.join("file1.txt");
+        let file2 = source_dir.join("file2.txt");
+        fs::write(&file1, "content1").unwrap();
+        fs::write(&file2, "content2").unwrap();
+        
+        let progress = ProgressCounter::new();
+        let (tx, rx) = unbounded::<FileTask>();
+        
+        // Test discovery with progress
+        let discover_result = discover_files(source_dir, dest_dir, tx, Some(progress.clone())).await;
+        assert!(discover_result.is_ok());
+        
+        // Check that files were discovered
+        let (discovered, _flagged, _copied, _bytes, _speed) = progress.get_stats();
+        assert_eq!(discovered, 2);
+        
+        // Test flagging with progress
+        let (comp_tx, _comp_rx) = unbounded::<FileTask>();
+        let populate_result = populate_dest_metadata(rx, comp_tx, Some(progress.clone())).await;
+        assert!(populate_result.is_ok());
+        
+        // Check that files were flagged for copying (since dest doesn't exist)
+        let (_discovered, flagged, _copied, _bytes, _speed) = progress.get_stats();
+        assert_eq!(flagged, 2);
     }
 }
