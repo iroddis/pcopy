@@ -50,9 +50,15 @@ impl FileTask {
         if let Some(target) = &self.symlink_target {
             if target.is_absolute() {
                 // For absolute symlinks, check if they point within the source tree
+                // First try to canonicalize, but if that fails, try direct prefix matching
                 if let Ok(canonical_target) = target.canonicalize() {
                     if let Ok(relative_to_source) = canonical_target.strip_prefix(source_root) {
                         // The symlink points within the source tree, transform it
+                        return Some(dest_root.join(relative_to_source));
+                    }
+                } else {
+                    // If canonicalization fails, try direct prefix matching
+                    if let Ok(relative_to_source) = target.strip_prefix(source_root) {
                         return Some(dest_root.join(relative_to_source));
                     }
                 }
@@ -344,4 +350,345 @@ async fn adjust_metadata(rx: async_channel::Receiver<FileTask>, dry_run: bool) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn create_test_file_task(
+        source_path: PathBuf,
+        dest_path: PathBuf,
+        symlink_target: Option<PathBuf>,
+    ) -> FileTask {
+        let metadata = if source_path.is_symlink() {
+            fs::symlink_metadata(&source_path).unwrap()
+        } else {
+            fs::metadata(&source_path).unwrap()
+        };
+        FileTask {
+            source_path,
+            dest_path,
+            source_metadata: metadata,
+            dest_metadata: None,
+            symlink_target,
+        }
+    }
+
+    #[test]
+    fn test_needs_copy_new_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        fs::write(&source_file, "test content").unwrap();
+        
+        let task = create_test_file_task(
+            source_file,
+            temp_dir.path().join("dest.txt"),
+            None,
+        );
+        
+        assert!(task.needs_copy());
+    }
+
+    #[test]
+    fn test_needs_copy_same_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let dest_file = temp_dir.path().join("dest.txt");
+        
+        fs::write(&source_file, "test content").unwrap();
+        fs::write(&dest_file, "test content").unwrap();
+        
+        let dest_metadata = fs::metadata(&dest_file).unwrap();
+        let mut task = create_test_file_task(source_file, dest_file, None);
+        task.dest_metadata = Some(dest_metadata);
+        
+        assert!(!task.needs_copy());
+    }
+
+    #[test]
+    fn test_needs_copy_different_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let dest_file = temp_dir.path().join("dest.txt");
+        
+        fs::write(&source_file, "test content longer").unwrap();
+        fs::write(&dest_file, "test content").unwrap();
+        
+        let dest_metadata = fs::metadata(&dest_file).unwrap();
+        let mut task = create_test_file_task(source_file, dest_file, None);
+        task.dest_metadata = Some(dest_metadata);
+        
+        assert!(task.needs_copy());
+    }
+
+    #[test]
+    fn test_symlink_transform_relative_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        let target_file = temp_dir.path().join("target.txt");
+        
+        fs::write(&target_file, "target content").unwrap();
+        symlink("./target.txt", &source_file).unwrap();
+        
+        let task = create_test_file_task(
+            source_file,
+            temp_dir.path().join("dest.txt"),
+            Some(PathBuf::from("./target.txt")),
+        );
+        
+        let source_root = temp_dir.path().join("source");
+        let dest_root = temp_dir.path().join("dest");
+        
+        let transformed = task.transform_symlink_target(&source_root, &dest_root);
+        assert_eq!(transformed, Some(PathBuf::from("./target.txt")));
+    }
+
+    #[test]
+    fn test_symlink_transform_absolute_within_source() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_root = temp_dir.path().join("source");
+        let dest_root = temp_dir.path().join("dest");
+        
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&dest_root).unwrap();
+        
+        let source_root = source_root.canonicalize().unwrap();
+        
+        let target_file = source_root.join("subdir").join("target.txt");
+        fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        fs::write(&target_file, "target content").unwrap();
+        
+        let source_file = source_root.join("source.txt");
+        symlink(&target_file, &source_file).unwrap();
+        
+        let task = create_test_file_task(
+            source_file,
+            dest_root.join("dest.txt"),
+            Some(target_file.clone()),
+        );
+        
+        let transformed = task.transform_symlink_target(&source_root, &dest_root);
+        assert_eq!(transformed, Some(dest_root.join("subdir").join("target.txt")));
+    }
+
+    #[test]
+    fn test_symlink_transform_absolute_outside_source() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_root = temp_dir.path().join("source");
+        let dest_root = temp_dir.path().join("dest");
+        
+        fs::create_dir_all(&source_root).unwrap();
+        
+        let external_target = PathBuf::from("/etc/passwd");
+        let source_file = source_root.join("source.txt");
+        
+        // Create a dummy file since we can't actually symlink to /etc/passwd in tests
+        fs::write(&source_file, "dummy").unwrap();
+        
+        let task = create_test_file_task(
+            source_file,
+            dest_root.join("dest.txt"),
+            Some(external_target.clone()),
+        );
+        
+        let transformed = task.transform_symlink_target(&source_root, &dest_root);
+        assert_eq!(transformed, Some(external_target));
+    }
+
+    #[test]
+    fn test_symlink_transform_none_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("source.txt");
+        fs::write(&source_file, "regular file").unwrap();
+        
+        let task = create_test_file_task(
+            source_file,
+            temp_dir.path().join("dest.txt"),
+            None,
+        );
+        
+        let source_root = temp_dir.path().join("source");
+        let dest_root = temp_dir.path().join("dest");
+        
+        let transformed = task.transform_symlink_target(&source_root, &dest_root);
+        assert_eq!(transformed, None);
+    }
+
+    #[tokio::test]
+    async fn test_discover_files_with_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        let dest_dir = temp_dir.path().join("dest");
+        
+        fs::create_dir_all(&source_dir).unwrap();
+        
+        // Create a regular file
+        let regular_file = source_dir.join("regular.txt");
+        fs::write(&regular_file, "regular content").unwrap();
+        
+        // Create a relative symlink
+        let rel_symlink = source_dir.join("rel_link.txt");
+        symlink("./regular.txt", &rel_symlink).unwrap();
+        
+        // Create a target file for absolute symlink
+        let abs_target = source_dir.join("abs_target.txt");
+        fs::write(&abs_target, "abs target content").unwrap();
+        
+        // Create absolute symlink
+        let abs_symlink = source_dir.join("abs_link.txt");
+        symlink(&abs_target, &abs_symlink).unwrap();
+        
+        let (tx, rx) = unbounded::<FileTask>();
+        
+        let discover_result = discover_files(source_dir, dest_dir, tx).await;
+        assert!(discover_result.is_ok());
+        
+        let mut tasks = Vec::new();
+        while let Ok(task) = rx.try_recv() {
+            tasks.push(task);
+        }
+        
+        // Should have 4 tasks: regular file, rel symlink, abs target, abs symlink
+        assert_eq!(tasks.len(), 4);
+        
+        // Check that symlinks have their targets recorded
+        let symlink_tasks: Vec<_> = tasks.iter().filter(|t| t.symlink_target.is_some()).collect();
+        assert_eq!(symlink_tasks.len(), 2);
+        
+        // Check relative symlink
+        let rel_task = tasks.iter().find(|t| t.source_path.file_name().unwrap() == "rel_link.txt").unwrap();
+        assert_eq!(rel_task.symlink_target, Some(PathBuf::from("./regular.txt")));
+        
+        // Check absolute symlink
+        let abs_task = tasks.iter().find(|t| t.source_path.file_name().unwrap() == "abs_link.txt").unwrap();
+        assert!(abs_task.symlink_target.is_some());
+        assert!(abs_task.symlink_target.as_ref().unwrap().is_absolute());
+    }
+
+    #[tokio::test]
+    async fn test_copy_files_with_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        let dest_dir = temp_dir.path().join("dest");
+        
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        
+        // Create target file
+        let target_file = source_dir.join("target.txt");
+        fs::write(&target_file, "target content").unwrap();
+        
+        // Create symlink
+        let symlink_file = source_dir.join("link.txt");
+        symlink("./target.txt", &symlink_file).unwrap();
+        
+        // Create FileTask for the symlink
+        let symlink_metadata = fs::symlink_metadata(&symlink_file).unwrap();
+        let task = FileTask {
+            source_path: symlink_file,
+            dest_path: dest_dir.join("link.txt"),
+            source_metadata: symlink_metadata,
+            dest_metadata: None,
+            symlink_target: Some(PathBuf::from("./target.txt")),
+        };
+        
+        let (task_tx, task_rx) = unbounded::<FileTask>();
+        let (copy_tx, copy_rx) = unbounded::<FileTask>();
+        
+        task_tx.send(task).await.unwrap();
+        task_tx.close();
+        
+        let copy_result = copy_files(task_rx, copy_tx, false, source_dir, dest_dir.clone()).await;
+        assert!(copy_result.is_ok());
+        
+        // Verify symlink was created
+        let dest_link = dest_dir.join("link.txt");
+        assert!(dest_link.is_symlink());
+        
+        // Verify symlink target is correct
+        let link_target = fs::read_link(&dest_link).unwrap();
+        assert_eq!(link_target, PathBuf::from("./target.txt"));
+        
+        // Verify a task was sent to the next stage
+        let copied_task = copy_rx.try_recv().unwrap();
+        assert!(copied_task.dest_metadata.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_copy_files_dry_run_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        let dest_dir = temp_dir.path().join("dest");
+        
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        
+        // Create symlink
+        let symlink_file = source_dir.join("link.txt");
+        symlink("./target.txt", &symlink_file).unwrap();
+        
+        let symlink_metadata = fs::symlink_metadata(&symlink_file).unwrap();
+        let task = FileTask {
+            source_path: symlink_file,
+            dest_path: dest_dir.join("link.txt"),
+            source_metadata: symlink_metadata,
+            dest_metadata: None,
+            symlink_target: Some(PathBuf::from("./target.txt")),
+        };
+        
+        let (task_tx, task_rx) = unbounded::<FileTask>();
+        let (copy_tx, copy_rx) = unbounded::<FileTask>();
+        
+        task_tx.send(task).await.unwrap();
+        task_tx.close();
+        
+        let copy_result = copy_files(task_rx, copy_tx, true, source_dir, dest_dir.clone()).await;
+        assert!(copy_result.is_ok());
+        
+        // Verify symlink was NOT created in dry run
+        let dest_link = dest_dir.join("link.txt");
+        assert!(!dest_link.exists());
+        
+        // Verify task was still sent to next stage
+        let copied_task = copy_rx.try_recv().unwrap();
+        assert!(copied_task.dest_metadata.is_none()); // No metadata in dry run
+    }
+
+    #[test]
+    fn test_symlink_edge_cases() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_root = temp_dir.path().join("source");
+        let dest_root = temp_dir.path().join("dest");
+        
+        // Test with empty symlink target
+        let source_file = temp_dir.path().join("source.txt");
+        fs::write(&source_file, "dummy").unwrap();
+        
+        let task = create_test_file_task(
+            source_file,
+            temp_dir.path().join("dest.txt"),
+            Some(PathBuf::from("")),
+        );
+        
+        let transformed = task.transform_symlink_target(&source_root, &dest_root);
+        assert_eq!(transformed, Some(PathBuf::from("")));
+        
+        // Test with complex relative path
+        let complex_rel = PathBuf::from("../../../some/deep/path");
+        let source_file2 = temp_dir.path().join("source2.txt");
+        fs::write(&source_file2, "dummy").unwrap();
+        
+        let task2 = create_test_file_task(
+            source_file2,
+            temp_dir.path().join("dest2.txt"),
+            Some(complex_rel.clone()),
+        );
+        
+        let transformed2 = task2.transform_symlink_target(&source_root, &dest_root);
+        assert_eq!(transformed2, Some(complex_rel));
+    }
 }
