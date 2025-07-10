@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_channel::unbounded;
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -26,6 +26,7 @@ struct FileTask {
     dest_path: PathBuf,
     source_metadata: std::fs::Metadata,
     dest_metadata: Option<std::fs::Metadata>,
+    symlink_target: Option<PathBuf>,
 }
 
 impl FileTask {
@@ -37,6 +38,32 @@ impl FileTask {
             dm.len() != sm.len()
         } else {
             true
+        }
+    }
+
+    // Transform symlink target path for absolute links
+    fn transform_symlink_target(
+        &self,
+        source_root: &Path,
+        dest_root: &Path,
+    ) -> Option<PathBuf> {
+        if let Some(target) = &self.symlink_target {
+            if target.is_absolute() {
+                // For absolute symlinks, check if they point within the source tree
+                if let Ok(canonical_target) = target.canonicalize() {
+                    if let Ok(relative_to_source) = canonical_target.strip_prefix(source_root) {
+                        // The symlink points within the source tree, transform it
+                        return Some(dest_root.join(relative_to_source));
+                    }
+                }
+                // If it doesn't point within source tree, keep it as-is
+                Some(target.clone())
+            } else {
+                // Relative symlinks are preserved as-is
+                Some(target.clone())
+            }
+        } else {
+            None
         }
     }
 }
@@ -74,8 +101,17 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { populate_dest_metadata(discovery_rx, comparison_tx).await });
 
     let copy_handles: Vec<_> = (0..parallelism)
-        .map(|_| (comparison_rx.clone(), copy_tx.clone()))
-        .map(|(comp, copy)| tokio::spawn(async move { copy_files(comp, copy, dry_run).await }))
+        .map(|_| {
+            (
+                comparison_rx.clone(),
+                copy_tx.clone(),
+                args.source.clone(),
+                args.destination.clone(),
+            )
+        })
+        .map(|(comp, copy, src, dest)| {
+            tokio::spawn(async move { copy_files(comp, copy, dry_run, src, dest).await })
+        })
         .collect();
 
     let md_handles: Vec<_> = (0..parallelism)
@@ -132,12 +168,21 @@ async fn discover_files(
             if metadata.is_dir() {
                 dirs.push(path.clone());
             }
+
+            // Check if this is a symlink and read its target
+            let symlink_target = if metadata.is_symlink() {
+                std::fs::read_link(&path).ok()
+            } else {
+                None
+            };
+
             if tx
                 .try_send(FileTask {
                     source_path: path.clone(),
                     dest_path: dest_path.clone(),
                     source_metadata: metadata,
                     dest_metadata: None,
+                    symlink_target,
                 })
                 .is_err()
             {
@@ -168,6 +213,8 @@ async fn copy_files(
     rx: async_channel::Receiver<FileTask>,
     tx: async_channel::Sender<FileTask>,
     dry_run: bool,
+    source_root: PathBuf,
+    dest_root: PathBuf,
 ) -> Result<()> {
     use std::fs;
 
@@ -175,6 +222,52 @@ async fn copy_files(
         if task.source_metadata.is_dir() {
             if !dry_run {
                 async_fs::create_dir_all(&task.dest_path).await?;
+            }
+        } else if task.source_metadata.is_symlink() {
+            // Handle symlinks
+            if let Some(parent) = task.dest_path.parent() {
+                if !dry_run {
+                    async_fs::create_dir_all(parent).await?;
+                }
+            }
+
+            if !dry_run {
+                // Remove existing symlink if it exists
+                if task.dest_path.exists() || task.dest_path.is_symlink() {
+                    fs::remove_file(&task.dest_path)?;
+                }
+
+                if let Some(transformed_target) =
+                    task.transform_symlink_target(&source_root, &dest_root)
+                {
+                    info!(
+                        "creating symlink {:?} -> {:?}",
+                        &task.dest_path, transformed_target
+                    );
+
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::symlink;
+                        symlink(&transformed_target, &task.dest_path)?;
+                    }
+
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::{symlink_dir, symlink_file};
+                        // On Windows, we need to know if the target is a directory or file
+                        // For simplicity, we'll try to determine this from the original source
+                        if task.source_path.is_dir() {
+                            symlink_dir(&transformed_target, &task.dest_path)?;
+                        } else {
+                            symlink_file(&transformed_target, &task.dest_path)?;
+                        }
+                    }
+                }
+
+                // Update the destination metadata
+                if let Ok(dm) = fs::symlink_metadata(&task.dest_path) {
+                    task.dest_metadata = Some(dm);
+                }
             }
         } else {
             if let Some(parent) = task.dest_path.parent() {
